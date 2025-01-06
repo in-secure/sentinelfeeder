@@ -7,7 +7,6 @@ IOCSPath="/home/misp/sentinelfeeder/iocs/"
 # MISP configuration; modify as needed
 MISPURL="https://127.0.0.1"
 MISPKey="INSERT KEY HERE"
-MISPLast=60m
 MISPOrg="INSERT ORG UUID HERE"
 
 # SENTINELONE configuration; modify as needed
@@ -24,10 +23,8 @@ function Fetch_IOCs {
 #emptying SentinelOne TI database from iocs older than X day, where X is equal to $lifetime variable
 function ClearIOCs {
     local lifetime=14
-    local Headers="Authorization: ApiToken $SentinelOneAPIKey"
-    local ThreatIntelUrl="$SentinelOneURL""web/api/v2.1/threat-intelligence/iocs"
     local uploadTime__lt=$(date -u -d "-$lifetime days" +"%Y-%m-%dT%H:%M:%SZ")
-    local Response=$(curl -X DELETE -s -H "$Headers" -H "Content-Type: application/json" -d "{\"filter\": {\"source\": \"Misp\", \"uploadTime__lt\": \"$uploadTime__lt\"}}" $ThreatIntelUrl)
+    local Response=$(curl -X DELETE -s -H "Authorization: ApiToken $SentinelOneAPIKey" -H "Content-Type: application/json" -d "{\"filter\": {\"source\": \"Misp\", \"uploadTime__lt\": \"$uploadTime__lt\"}}" "$SentinelOneURL""web/api/v2.1/threat-intelligence/iocs")
 
     if [[ "$Response" != *"data"* ]]; then
         echo "ERROR deleting indicators from SentinelOne Threat Intelligence Database; Check log file"
@@ -37,79 +34,87 @@ function ClearIOCs {
 }
 
 function Push_IOCs {
-    local HeadersGET="Authorization: $MISPKey"
-    local Data="{\"type\":\"$@\",\"org\":\"$MISPOrg\",\"timestamp\": \"$MISPLast\"}"
+    #calculate difference in seconds since last update of iocs; based on file timestamp
+    if [[ "$@" = "domain" ]]; then
+	local last_mod=$(stat -c %Y "${IOCSPath}dns-list.txt")
+    elif [[ "$@" = "ip-src" ]]; then
+        local last_mod=$(stat -c %Y "${IOCSPath}ipv4-list.txt")
+    else
+        local last_mod=$(stat -c %Y "${IOCSPath}${@}-list.txt")
+    fi
+
+    local now=$(date +%s)
+    local diff_seconds=$((now - last_mod - 300))
+    local MISPLast=$((diff_seconds / 60))m
+
+
+    local Data="{\"type\":\"$@\",\"org\":\"$MISPOrg\",\"last\": \"$MISPLast\"}"
 
     local ValidUntil=""
-    local ThreatIntelUrl="$SentinelOneURL""web/api/v2.1/threat-intelligence/iocs"
-    local Headers="Authorization: ApiToken $SentinelOneAPIKey"
     local JsonPayload=""
 
     # exporting attribute from MISP
-    EventArray=$(curl -s --insecure -X POST -H "$HeadersGET" -H "Accept: application/json" -H "Content-Type: application/json" -d "$Data" "$MISPURL/attributes/restSearch")
-    matrice=""
+    local EventArray=$(curl -s --insecure -X POST -H "Authorization: $MISPKey" -H "Accept: application/json" -H "Content-Type: application/json" -d "$Data" "$MISPURL/attributes/restSearch")
+    local matrice=""
 
     # checking ioc type and qty
-    type=($(jq -r '.response.Attribute[0].type' <<< "$EventArray"))
-    length=($(jq '.response.Attribute | length' <<< "$EventArray" ))
+    local type=($(jq -r '.response.Attribute[0].type' <<< "$EventArray"))
+    local length=($(jq '.response.Attribute | length' <<< "$EventArray" ))
 
     if [[ "$type" = "null" ]]; then
         echo "No indicator of type $@ present on Misp."
-      	return
+	return
     fi
+
 
     #setting lifetime based on type of indicator; see API doc for lifetime reference
     if [[ "$type" = "domain" ]]; then
-	    type="dns"
-	    ValidUntil=$(date -u -d "+14 days" +"%Y-%m-%dT%H:%M:%SZ")
+	type="dns"
+	ValidUntil=$(date -u -d "+14 days" +"%Y-%m-%dT%H:%M:%SZ")
     elif [[ "$type" = "url" ]]; then
-	    type="url"
-	    ValidUntil=$(date -u -d "+14 days" +"%Y-%m-%dT%H:%M:%SZ")
+	type="url"
+	ValidUntil=$(date -u -d "+14 days" +"%Y-%m-%dT%H:%M:%SZ")
     elif [[ "$type" = "ip-src" ]]; then
-	    type='ipv4'
-	    ValidUntil=$(date -u -d "+14 days" +"%Y-%m-%dT%H:%M:%SZ")
+	type='ipv4'
+	ValidUntil=$(date -u -d "+14 days" +"%Y-%m-%dT%H:%M:%SZ")
     elif [[ "$type" = "sha1" ]]; then
-	    type='sha1'
-	    ValidUntil=$(date -u -d "+14 days" +"%Y-%m-%dT%H:%M:%SZ")
+	type='sha1'
+	ValidUntil=$(date -u -d "+14 days" +"%Y-%m-%dT%H:%M:%SZ")
     elif [[ "$type" = "sha256" ]]; then
-	    ValidUntil=$(date -u -d "+14 days" +"%Y-%m-%dT%H:%M:%SZ")
+	ValidUntil=$(date -u -d "+14 days" +"%Y-%m-%dT%H:%M:%SZ")
     fi
-    
     #empty indicator file
     cat /dev/null > "$IOCSPath""$type""-list.txt"
 
-    while [ $(jq '.response.Attribute | length' <<< "$EventArray") -gt 0 ]; do
-    	matrice[0]=$(jq '.response.Attribute['0'].value' <<< "$EventArray")
-    	matrice[1]=$(jq '.response.Attribute['0'].category' <<< "$EventArray")
-    	matrice[2]=$(jq '.response.Attribute['0'].first_seen' <<< "$EventArray")
-    	matrice[3]=$(jq '.response.Attribute['0'].Event.info' <<< "$EventArray")
-    
-    	EventArray=$(jq 'del(.response.Attribute['0'])' <<< "$EventArray" -r) 
-    
-    	JsonPayload+="{\"source\": \"Misp\","
-    	JsonPayload+="\"method\": \"EQUALS\","
-    	JsonPayload+="\"type\": \"${type^^}\","
-    	JsonPayload+="\"value\": ${matrice[0]},"
-    	JsonPayload+="\"category\": ${matrice[1]},"
-    	JsonPayload+="\"creationTime\": ${matrice[2]},"
-    	JsonPayload+="\"malwareNames\": \""$(echo ${matrice[3]} | awk '{ print $NF }')","
-    	JsonPayload+="\"validUntil\": \"$ValidUntil\"},"
-    
-    	sed 's/"//g' <<< "${matrice[0]}" >> "$IOCSPath""$type""-list.txt"
-    done
+    #cycling through the response
+    jq -r '.response.Attribute[] | [.value, .category, .first_seen, .Event.info] | @tsv' <<< "$EventArray" > "${IOCSPath}extracted_data.tsv"
+
+	while IFS=$'\t' read -r value category first_seen event_info; do
+	    JsonPayload+="{\"source\":\"Misp\",\"method\":\"EQUALS\","
+	    JsonPayload+="\"type\":\"${type^^}\","
+	    JsonPayload+="\"value\":\"$value\","
+	    JsonPayload+="\"category\":\"$category\","
+	    JsonPayload+="\"creationTime\":\"$first_seen\","
+	    JsonPayload+="\"malwareNames\":\"$(echo "$event_info" | awk '{ print $NF }')\","
+	    JsonPayload+="\"validUntil\":\"$ValidUntil\"},"
+
+    	    echo "$value" >> "${IOCSPath}${type}-list.txt"
+	done < "${IOCSPath}extracted_data.tsv"
+    rm -f "${IOCSPath}extracted_data.tsv"
+
 
     JsonPayload="${JsonPayload%,}"
-    # SEE VARIABLE DEFINITION FOR PUSHING ON SITE ONLY
     #echo "{\"filter\": {\"siteIds\": [\"$SiteId\"]},\"data\": [$JsonPayload]}" > "$IOCSPath""data_file.json"
     echo "{\"filter\": {\"accountIds\": [\"$AccountId\"]},\"data\": [$JsonPayload]}" > "$IOCSPath""data_file.json"
 
-    local Response=$(curl -X POST -s -H "$Headers" -H "Content-Type: application/json" --data-binary "@""$IOCSPath""data_file.json" "$ThreatIntelUrl")
+
+    local Response=$(curl -X POST -s -H "Authorization: ApiToken $SentinelOneAPIKey" -H "Content-Type: application/json" --data-binary "@""$IOCSPath""data_file.json" "$SentinelOneURL""web/api/v2.1/threat-intelligence/iocs")
     echo "$Response" > "$LOGSPath""sentinel_""$type"".log"
     local validating=$(echo "$Response" | jq -r '.data[0].batchId')
     if [[ -z "$validating" ]]; then
         echo "ERROR importing $type indicator from Misp to SentinelOne Threat Intelligence Database; Check log file"
     else
-      	echo "$length Indicator $type imported Correctly to SentinelOne Threat Intelligence Database."
+	echo "$length Indicator $type imported Correctly to SentinelOne Threat Intelligence Database."
     fi
 }
 
